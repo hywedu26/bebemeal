@@ -1,0 +1,74 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "Stores user preferences and baby information.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "babyName": { "type": "string" },
+        "babyBirthday": { "type": "string", "format": "date" },
+        "mealsPerDay": { "type": "integer" },
+        "sideDishesPerMeal": { "type": "integer" },
+        "driveFolderId": { "type": "string" }
+      },
+      "required": ["uid", "email"]
+    },
+    "InventoryItem": {
+      "title": "Inventory Item",
+      "description": "Represents a food ingredient or meal stock.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "name": { "type": "string" },
+        "category": { "type": "string", "enum": ["carbohydrate", "protein", "vegetable", "fruit", "raw"] },
+        "quantity": { "type": "number" },
+        "unit": { "type": "string" },
+        "addedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "name", "category", "quantity"]
+    },
+    "MealRecord": {
+      "title": "Meal Record",
+      "description": "Records what the baby ate.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "date": { "type": "string", "format": "date" },
+        "mealIndex": { "type": "integer" },
+        "recipeName": { "type": "string" },
+        "ingredients": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["uid", "date", "mealIndex", "recipeName"]
+    },
+    "UserToken": {
+      "title": "User Token",
+      "description": "Stores Google Drive OAuth tokens.",
+      "type": "object",
+      "properties": {
+        "tokens": { "type": "object" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["tokens"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile and settings."
+    },
+    "/inventory/{itemId}": {
+      "schema": "InventoryItem",
+      "description": "User's food inventory."
+    },
+    "/meals/{mealId}": {
+      "schema": "MealRecord",
+      "description": "History of meals fed to the baby."
+    },
+    "/user_tokens/{userId}": {
+      "schema": "UserToken",
+      "description": "Google Drive OAuth tokens for a user."
+    }
+  }
+}
