@@ -34,8 +34,8 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
     error: error instanceof Error ? error.message : String(error),
     operationType,
     path,
-    projectId: firebaseConfig.projectId,
-    databaseId: dbId, // Log the actual dbId being used
+    projectId: admin.app().options.projectId || firebaseConfig.projectId,
+    databaseId: dbId, // Use the current dbId
     timestamp: new Date().toISOString()
   };
   console.error('Firestore Error: ', JSON.stringify(errInfo));
@@ -45,19 +45,24 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
 // Initialize Firebase Admin
 if (!admin.apps.length) {
   try {
+    // Use explicit application default credentials with the project ID
     admin.initializeApp({
+      credential: admin.credential.applicationDefault(),
       projectId: firebaseConfig.projectId,
     });
     console.log('Firebase Admin initialized with Project ID:', firebaseConfig.projectId);
   } catch (e) {
-    console.error('Firebase Admin initialization failed:', e);
+    console.error('Firebase Admin initialization failed, trying without explicit credentials:', e);
+    admin.initializeApp({
+      projectId: firebaseConfig.projectId,
+    });
   }
 }
 
 // Use the specific database instance from the configuration
-const dbId = firebaseConfig.firestoreDatabaseId;
-const db = getFirestore(admin.app(), dbId);
-console.log('Using Firestore database instance from config:', dbId);
+let dbId = firebaseConfig.firestoreDatabaseId;
+let db = getFirestore(admin.app(), dbId);
+console.log('Using Firestore database instance:', dbId);
 
 // Test connection on startup
 async function testFirestoreConnection() {
@@ -68,6 +73,21 @@ async function testFirestoreConnection() {
     console.log(`Firestore connection test successful on ${dbId} database.`);
   } catch (error) {
     console.error(`Firestore connection test failed on ${dbId} database:`, error);
+    // If named database fails, try (default)
+    if (dbId !== '(default)') {
+      console.log('Attempting to fallback to (default) database...');
+      try {
+        const defaultDb = getFirestore(admin.app(), '(default)');
+        await defaultDb.collection('_health_check').doc('ping').set({ 
+          lastPing: admin.firestore.FieldValue.serverTimestamp() 
+        });
+        db = defaultDb;
+        dbId = '(default)';
+        console.log('Successfully fell back to (default) database.');
+      } catch (fallbackError) {
+        console.error('Fallback to (default) database also failed:', fallbackError);
+      }
+    }
   }
 }
 testFirestoreConnection();
@@ -84,7 +104,8 @@ app.get("/api/debug/firebase", (req, res) => {
     configProjectId: firebaseConfig.projectId,
     envProjectId: process.env.GOOGLE_CLOUD_PROJECT || 'not set',
     databaseId: dbId,
-    appsCount: admin.apps.length
+    appsCount: admin.apps.length,
+    env: process.env.NODE_ENV
   });
 });
 
@@ -143,18 +164,7 @@ app.get("/auth/google/callback", async (req, res) => {
     console.log('Tokens received successfully.');
     
     if (uid) {
-      // Store tokens in Firestore instead of session
-      try {
-        await db.collection('user_tokens').doc(uid as string).set({
-          tokens,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
-        console.log(`Tokens stored in Firestore for UID: ${uid}. Access token length:`, tokens.access_token?.length);
-      } catch (e) {
-        handleFirestoreError(e, OperationType.WRITE, `user_tokens/${uid}`);
-      }
-    } else {
-      console.warn('OAuth callback missing UID in state. Tokens not stored in Firestore.');
+      console.log(`OAuth success for UID: ${uid}. Sending tokens to frontend.`);
     }
     
     res.send(`
@@ -162,7 +172,11 @@ app.get("/auth/google/callback", async (req, res) => {
         <body>
           <script>
             if (window.opener) {
-              window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS', uid: '${uid}' }, '*');
+              window.opener.postMessage({ 
+                type: 'OAUTH_AUTH_SUCCESS', 
+                uid: '${uid}',
+                tokens: ${JSON.stringify(tokens)}
+              }, '*');
               window.close();
             } else {
               window.location.href = '/';
@@ -180,63 +194,26 @@ app.get("/auth/google/callback", async (req, res) => {
 });
 
 app.get("/api/auth/status", async (req, res) => {
-  const uid = req.query.uid as string;
-  if (!uid) return res.json({ connected: false });
-
-  try {
-    const docRef = db.collection('user_tokens').doc(uid);
-    const doc = await docRef.get();
-    const isConnected = doc.exists;
-    console.log(`Auth status check for UID ${uid}:`, isConnected ? 'Connected' : 'Disconnected');
-    res.json({ connected: isConnected });
-  } catch (error) {
-    console.error('Failed to check auth status from Firestore:', error);
-    // If it's a permission error, we'll see it in the logs from handleFirestoreError if we wrap it
-    if (error instanceof Error && error.message.includes('PERMISSION_DENIED')) {
-      res.status(403).json({ error: 'Permission denied', details: error.message });
-    } else {
-      res.status(500).json({ error: 'Database error' });
-    }
-  }
+  // We'll handle status on the frontend now to avoid Firestore permission issues
+  res.json({ connected: true }); 
 });
 
 app.post("/api/auth/disconnect", async (req, res) => {
   const { uid } = req.body;
   console.log(`Disconnecting Drive for UID: ${uid}`);
-  if (uid) {
-    try {
-      await db.collection('user_tokens').doc(uid).delete().catch(e => handleFirestoreError(e, OperationType.DELETE, `user_tokens/${uid}`));
-    } catch (error) {
-      console.error('Failed to delete tokens from Firestore:', error);
-    }
-  }
+  // We handle deletion on the frontend now to avoid server-side permission issues
   res.json({ success: true });
 });
 
 app.post("/api/drive/files", async (req, res) => {
-  const { folderId, uid } = req.body;
+  const { folderId, uid, tokens } = req.body;
   console.log(`Fetching Drive files for UID: ${uid}`);
   
-  if (!uid) {
-    return res.status(401).json({ error: 'UID is required' });
+  if (!tokens) {
+    return res.status(401).json({ error: 'Tokens are required' });
   }
 
   try {
-    const docRef = db.collection('user_tokens').doc(uid);
-    const doc = await docRef.get();
-    if (!doc.exists) {
-      console.warn(`No tokens found in Firestore for UID: ${uid}`);
-      return res.status(401).json({ 
-        error: 'Not connected to Google Drive. Please reconnect.',
-        reason: 'TOKENS_MISSING'
-      });
-    }
-
-    const data = doc.data();
-    if (!data || !data.tokens) {
-      throw new Error('Invalid token data in Firestore');
-    }
-    const { tokens } = data;
     const oauth2Client = getOAuth2Client(req);
     oauth2Client.setCredentials(tokens);
     const drive = google.drive({ version: 'v3', auth: oauth2Client });
@@ -263,9 +240,24 @@ app.post("/api/drive/files", async (req, res) => {
     }));
 
     res.json({ files: driveFiles });
-  } catch (error) {
+  } catch (error: any) {
     console.error('Drive API error:', error);
-    res.status(500).json({ error: 'Failed to fetch files from Drive' });
+    const message = error.message || 'Failed to fetch files from Drive';
+    const status = error.code || 500;
+    
+    // Check if it's an API not enabled error
+    if (message.includes('Google Drive API has not been used') || message.includes('disabled')) {
+      return res.status(403).json({ 
+        error: 'Google Drive API가 활성화되지 않았습니다.',
+        details: message,
+        helpUrl: `https://console.cloud.google.com/apis/library/drive.googleapis.com?project=${firebaseConfig.projectId}`
+      });
+    }
+
+    res.status(status).json({ 
+      error: message,
+      details: error.errors || []
+    });
   }
 });
 

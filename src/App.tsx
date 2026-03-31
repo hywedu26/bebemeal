@@ -519,11 +519,13 @@ const Recipes = ({ inventory, profile, userId }: { inventory: InventoryItem[]; p
   const [selectedRecipe, setSelectedRecipe] = useState<RecipeRecommendation | null>(null);
   const [customIngredients, setCustomIngredients] = useState('');
   const [driveConnected, setDriveConnected] = useState(false);
+  const [tokens, setTokens] = useState<any>(null);
   const [folderId, setFolderId] = useState(profile?.driveFolderId || '');
   const [driveFilesList, setDriveFilesList] = useState<{ name: string; mimeType: string }[]>([]);
   const [fetchingFiles, setFetchingFiles] = useState(false);
   const [showLearnedList, setShowLearnedList] = useState(false);
   const [groundingSources, setGroundingSources] = useState<{ title: string; uri: string }[]>([]);
+  const [driveError, setDriveError] = useState<{ message: string; helpUrl?: string } | null>(null);
 
   interface RecipeRecommendation {
     title: string;
@@ -543,29 +545,55 @@ const Recipes = ({ inventory, profile, userId }: { inventory: InventoryItem[]; p
 
   useEffect(() => {
     checkDriveStatus();
-    const handleMessage = (event: MessageEvent) => {
+    const handleMessage = async (event: MessageEvent) => {
       // Check if the message is from our OAuth popup
       if (event.data?.type === 'OAUTH_AUTH_SUCCESS') {
-        console.log('OAuth success message received from popup');
-        setDriveConnected(true);
-        // Also check status from server to confirm session is valid
-        setTimeout(() => {
-          checkDriveStatus();
-        }, 2000);
+        console.log('OAuth success message received from popup:', event.data);
+        const { tokens: newTokens, uid } = event.data;
+        
+        if (newTokens && uid === userId) {
+          setTokens(newTokens);
+          setDriveConnected(true);
+          
+          // Save tokens to Firestore from the FRONTEND (Client SDK has permission)
+          try {
+            await setDoc(doc(db, 'user_tokens', userId), {
+              tokens: newTokens,
+              updatedAt: new Date().toISOString()
+            });
+            console.log('Tokens saved to Firestore successfully from frontend.');
+          } catch (error) {
+            console.error('Failed to save tokens to Firestore from frontend:', error);
+          }
+        }
       }
     };
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, []);
+  }, [userId]);
 
   const checkDriveStatus = async () => {
     if (!userId) return;
     console.log('Checking Google Drive connection status for UID:', userId);
     try {
+      // Try to get tokens from Firestore using Client SDK
+      const docRef = doc(db, 'user_tokens', userId);
+      const docSnap = await getDocFromServer(docRef);
+      
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data && data.tokens) {
+          setTokens(data.tokens);
+          setDriveConnected(true);
+          console.log('Drive tokens found in Firestore.');
+          return;
+        }
+      }
+      
+      // Fallback to server check if needed (though server check is now simplified)
       const res = await fetch(`/api/auth/status?uid=${userId}`, { credentials: 'include' });
       const data = await res.json();
-      console.log('Drive status response:', data);
-      setDriveConnected(data.connected);
+      setDriveConnected(data.connected && !!tokens);
     } catch (error) {
       console.error('Failed to check Drive status:', error);
     }
@@ -585,13 +613,19 @@ const Recipes = ({ inventory, profile, userId }: { inventory: InventoryItem[]; p
   const handleDisconnectDrive = async () => {
     if (!userId) return;
     try {
+      // Delete tokens from Firestore using Client SDK
+      await deleteDoc(doc(db, 'user_tokens', userId));
+      
+      // Also notify server
       await fetch('/api/auth/disconnect', { 
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ uid: userId }),
         credentials: 'include'
       });
+      
       setDriveConnected(false);
+      setTokens(null);
       setDriveFilesList([]);
       setRecipes([]);
       setSelectedRecipe(null);
@@ -601,15 +635,25 @@ const Recipes = ({ inventory, profile, userId }: { inventory: InventoryItem[]; p
   };
 
   const getDriveFiles = async (retryCount = 0): Promise<any[]> => {
-    if (!driveConnected || !folderId || !userId) return [];
+    if (!driveConnected || !folderId || !userId || !tokens) return [];
+    setDriveError(null);
     try {
       const res = await fetch('/api/drive/files', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ folderId, uid: userId }),
+        body: JSON.stringify({ folderId, uid: userId, tokens }),
         credentials: 'include'
       });
       
+      if (res.status === 403) {
+        const errorData = await res.json();
+        setDriveError({
+          message: errorData.error || 'Google Drive API가 활성화되지 않았습니다.',
+          helpUrl: errorData.helpUrl
+        });
+        return [];
+      }
+
       if (res.status === 401) {
         if (retryCount < 2) {
           console.log(`Fetch failed with 401, retrying... (attempt ${retryCount + 1})`);
@@ -820,6 +864,27 @@ const Recipes = ({ inventory, profile, userId }: { inventory: InventoryItem[]; p
               </div>
             )}
           </div>
+
+          {driveError && (
+            <div className="mb-4 p-3 bg-red-50 border border-red-100 rounded-xl flex flex-col gap-2">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+                <p className="text-xs text-red-700 leading-relaxed font-medium">
+                  {driveError.message}
+                </p>
+              </div>
+              {driveError.helpUrl && (
+                <Button 
+                  onClick={() => window.open(driveError.helpUrl, '_blank')}
+                  variant="outline" 
+                  size="sm" 
+                  className="w-full h-8 text-[10px] gap-1.5 border-red-200 text-red-600 hover:bg-red-100"
+                >
+                  <ExternalLink className="w-3 h-3" /> 지금 API 활성화하기
+                </Button>
+              )}
+            </div>
+          )}
 
           {driveConnected && (
             <div className="space-y-3">
